@@ -668,9 +668,35 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("model")
 
+    def _reconcile_engines(self):
+        """
+        Drop engines whose pod is gone from the cluster.
+
+        The watch stream is the only source of removals, so a DELETED event
+        that lands while the connection is down is lost for good and the
+        engine keeps receiving traffic. Listing on every (re)connection
+        closes that window: the watch keeps handling the steady state, the
+        list repairs whatever it missed.
+        """
+        pods = self.k8s_api.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=self.label_selector,
+        )
+        live_pods = {pod.metadata.name for pod in pods.items}
+
+        with self.available_engines_lock:
+            stale = set(self.available_engines) - live_pods
+            for engine_name in stale:
+                logger.warning(
+                    f"Serving engine {engine_name} no longer exists but was "
+                    f"still registered: dropping it"
+                )
+                del self.available_engines[engine_name]
+
     def _watch_engines(self):
         while self.running:
             try:
+                self._reconcile_engines()
                 for event in self.k8s_watcher.stream(
                     self.k8s_api.list_namespaced_pod,
                     namespace=self.namespace,

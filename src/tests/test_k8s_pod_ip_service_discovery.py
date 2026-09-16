@@ -125,3 +125,47 @@ def test_modified_not_ready_with_ip_removes_registered():
     )
 
     assert "pod-c" not in d.available_engines
+
+
+def test_reconcile_drops_engine_whose_pod_is_gone():
+    """A DELETED event missed while the watch was down leaves a ghost.
+
+    The watch stream is the only source of removals, so an engine whose pod
+    disappeared during a disconnect is never dropped and keeps taking
+    traffic. Listing on reconnection must remove it.
+    """
+    d = _make_discovery()
+    d.label_selector = "environment=test"
+    _register(d, "pod-gone")
+    _register(d, "pod-alive")
+
+    still_running = MagicMock()
+    still_running.metadata.name = "pod-alive"
+    d.k8s_api = MagicMock()
+    d.k8s_api.list_namespaced_pod.return_value = MagicMock(items=[still_running])
+
+    d._reconcile_engines()
+
+    assert "pod-gone" not in d.available_engines
+    assert "pod-alive" in d.available_engines
+
+
+def test_reconcile_keeps_every_live_engine():
+    """The list must never drop an engine whose pod is still there."""
+    d = _make_discovery()
+    d.label_selector = "environment=test"
+    _register(d, "pod-a")
+    _register(d, "pod-b")
+
+    pods = []
+    for name in ("pod-a", "pod-b"):
+        pod = MagicMock()
+        pod.metadata.name = name
+        pods.append(pod)
+
+    d.k8s_api = MagicMock()
+    d.k8s_api.list_namespaced_pod.return_value = MagicMock(items=pods)
+
+    d._reconcile_engines()
+
+    assert set(d.available_engines) == {"pod-a", "pod-b"}
