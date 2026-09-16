@@ -127,22 +127,55 @@ def test_modified_not_ready_with_ip_removes_registered():
     assert "pod-c" not in d.available_engines
 
 
-def test_reconcile_drops_engine_whose_pod_is_gone():
-    """A DELETED event missed while the watch was down leaves a ghost.
+# ---------------------------------------------------------------------------
+# Reconciliation on watch reconnect
+#
+# The watch stream is the only source of removals, so a DELETED event lost
+# during a disconnect leaves a ghost engine. Listing before each stream repairs
+# it, and the watch starts at the list's resourceVersion so nothing slips
+# between the two calls. Since the watch no longer replays ADDED events, the
+# reconciliation is also the startup discovery path.
+# ---------------------------------------------------------------------------
 
-    The watch stream is the only source of removals, so an engine whose pod
-    disappeared during a disconnect is never dropped and keeps taking
-    traffic. Listing on reconnection must remove it.
-    """
+
+def _make_pod(name, ip="10.0.0.1", ready=True, terminating=False, labels=None):
+    pod = MagicMock()
+    pod.metadata.name = name
+    pod.metadata.labels = {} if labels is None else labels
+    pod.metadata.deletion_timestamp = None if not terminating else "2026-01-01T00:00:00Z"
+    pod.status.pod_ip = ip
+    pod.status.container_statuses = [MagicMock(ready=ready)]
+    return pod
+
+
+def _make_reconciler(pods, engines=None):
     d = _make_discovery()
     d.label_selector = "environment=test"
-    _register(d, "pod-gone")
-    _register(d, "pod-alive")
-
-    still_running = MagicMock()
-    still_running.metadata.name = "pod-alive"
+    d.available_engines = engines or {}
     d.k8s_api = MagicMock()
-    d.k8s_api.list_namespaced_pod.return_value = MagicMock(items=[still_running])
+    d.k8s_api.list_namespaced_pod.return_value = MagicMock(
+        items=pods, metadata=MagicMock(resource_version="4242")
+    )
+    d._get_model_names = MagicMock(return_value=["m"])
+    d._get_model_label = MagicMock(side_effect=lambda pod: (pod.metadata.labels or {}).get("model"))
+    d._add_engine = MagicMock()
+    return d
+
+
+def _registered(url="http://10.0.0.1:8000", model_label=None, sleep=False):
+    known = MagicMock(spec=EndpointInfo)
+    known.url = url
+    known.model_label = model_label
+    known.sleep = sleep
+    return known
+
+
+def test_reconcile_drops_engine_whose_pod_is_gone():
+    """Core regression: the DELETED event was missed, the list must repair it."""
+    d = _make_reconciler(
+        pods=[_make_pod("pod-alive")],
+        engines={"pod-gone": _registered(url="http://10.0.0.9:8000"), "pod-alive": _registered()},
+    )
 
     d._reconcile_engines()
 
@@ -150,22 +183,73 @@ def test_reconcile_drops_engine_whose_pod_is_gone():
     assert "pod-alive" in d.available_engines
 
 
-def test_reconcile_keeps_every_live_engine():
-    """The list must never drop an engine whose pod is still there."""
-    d = _make_discovery()
-    d.label_selector = "environment=test"
-    _register(d, "pod-a")
-    _register(d, "pod-b")
-
-    pods = []
-    for name in ("pod-a", "pod-b"):
-        pod = MagicMock()
-        pod.metadata.name = name
-        pods.append(pod)
-
-    d.k8s_api = MagicMock()
-    d.k8s_api.list_namespaced_pod.return_value = MagicMock(items=pods)
+def test_reconcile_discovers_pods_at_startup():
+    """The watch no longer replays ADDED, so the list must populate the table."""
+    d = _make_reconciler(pods=[_make_pod("pod-a", ip="10.0.0.1"), _make_pod("pod-b", ip="10.0.0.2")])
 
     d._reconcile_engines()
 
-    assert set(d.available_engines) == {"pod-a", "pod-b"}
+    assert {c.args[0] for c in d._add_engine.call_args_list} == {"pod-a", "pod-b"}
+
+
+def test_reconcile_skips_unchanged_pod():
+    """A ready pod already registered at the same URL must not be re-queried."""
+    d = _make_reconciler(pods=[_make_pod("pod-a")], engines={"pod-a": _registered()})
+
+    d._reconcile_engines()
+
+    d._get_model_names.assert_not_called()
+    d._add_engine.assert_not_called()
+
+
+def test_reconcile_drops_pod_that_became_not_ready():
+    """A readiness change missed during the disconnect must still be applied."""
+    d = _make_reconciler(
+        pods=[_make_pod("pod-a", ready=False)], engines={"pod-a": _registered()}
+    )
+
+    d._reconcile_engines()
+
+    assert "pod-a" not in d.available_engines
+
+
+def test_reconcile_drops_pod_with_cleared_ip():
+    """An evicted pod keeps its object but loses its IP."""
+    d = _make_reconciler(pods=[_make_pod("pod-a", ip=None)], engines={"pod-a": _registered()})
+
+    d._reconcile_engines()
+
+    assert "pod-a" not in d.available_engines
+
+
+def test_reconcile_rehandles_pod_whose_sleep_label_changed():
+    """/sleep patches the pod; missing that event would keep routing to it."""
+    d = _make_reconciler(
+        pods=[_make_pod("pod-a", labels={"sleeping": "true"})],
+        engines={"pod-a": _registered(sleep=False)},
+    )
+
+    d._reconcile_engines()
+
+    d._add_engine.assert_called_once()
+
+
+def test_reconcile_returns_the_list_resource_version():
+    """The watch must start where the list stopped, leaving no gap."""
+    d = _make_reconciler(pods=[_make_pod("pod-a")], engines={"pod-a": _registered()})
+
+    assert d._reconcile_engines() == "4242"
+
+
+def test_reconcile_survives_one_broken_pod():
+    """One unreachable pod must not abort discovery for the others."""
+    d = _make_reconciler(pods=[_make_pod("pod-bad", ip="10.0.0.1"), _make_pod("pod-ok", ip="10.0.0.2")])
+    d._get_model_names = MagicMock(
+        side_effect=lambda ip: (_ for _ in ()).throw(RuntimeError("unreachable"))
+        if ip == "10.0.0.1"
+        else ["m"]
+    )
+
+    d._reconcile_engines()
+
+    assert [c.args[0] for c in d._add_engine.call_args_list] == ["pod-ok"]
